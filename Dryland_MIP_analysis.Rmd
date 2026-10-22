@@ -1,0 +1,607 @@
+---
+title: "Native grass cover as a field indicator of mycorrhizal inoculum potential in Southwestern drylands: analysis code"
+author: "RN Corwin"
+date: "October 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+This document reproduces the analyses, figures, and supplementary figures in the
+manuscript. Expected folder layout:
+
+```
+Dryland_MIP_analysis.Rmd
+data/Dryland_Mycorrhizal_Inoculum_Potential.xlsx   
+figures/          #created automatically; all figs written here
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.5
+)
+```
+
+# 1. Packages and settings
+
+```{r packages}
+library(readxl)      
+library(dplyr)       
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)    
+library(patchwork)   
+library(ggpmisc)     
+library(ggrepel)     
+library(corrplot)    
+library(car)         
+library(emmeans)    
+library(effectsize)  
+library(vegan)       
+library(glmmTMB)     
+library(DHARMa)      
+library(performance) 
+library(parameters)  
+library(ggeffects)   
+
+set.seed(123)
+
+data_dir <- "data"
+fig_dir  <- "figures"
+dir.create(fig_dir, showWarnings = FALSE)
+
+#fig widths follow journal column widths
+width_double <- 174
+
+#shared colors (Okabe-Ito, colorblind-friendly) and labels
+transect_cols   <- c("Reference" = "#009E73", "Disturbed" = "#D55E00")
+site_labels     <- c(
+  "Babbitt" = "Babbitt PJ", "BarTBar" = "Bar T Bar", "Canyonlands" = "CRC",
+  "Flying M" = "Flying M", "Petrified Forest" = "Petrified Forest",
+  "Spiderweb" = "Spiderweb"
+)
+
+theme_pub <- theme_bw(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey92"),
+    legend.position  = "bottom"
+  )
+
+#save ggplot figs as PNG and PDF
+save_fig <- function(plot, name, width = width_double, height = 100) {
+  ggsave(file.path(fig_dir, paste0(name, ".png")), plot,
+         width = width, height = height, units = "mm", dpi = 600)
+  pdf_dev <- if (capabilities("cairo")) cairo_pdf else "pdf"  # cairo renders the dagger symbol
+  ggsave(file.path(fig_dir, paste0(name, ".pdf")), plot,
+         width = width, height = height, units = "mm", device = pdf_dev)
+}
+
+#save base-graphics figs (corrplot, DHARMa) as PNG
+save_base_fig <- function(name, plot_expr, width = width_double, height = 110) {
+  png(file.path(fig_dir, paste0(name, ".png")),
+      width = width, height = height, units = "mm", res = 600)
+  on.exit(dev.off())
+  plot_expr
+}
+```
+
+# 2. Data import
+
+Empty root-scoring cells mean a structure was not observed, and blank biocrust
+cells (two Flying M Reference points) mean no biocrust, so both are set to 0.
+
+```{r import}
+mip_all <- read_excel(file.path(data_dir, "Dryland_Mycorrhizal_Inoculum_Potential.xlsx")) %>%
+  mutate(
+    across(no_fungus:am_RLC, ~ replace_na(as.numeric(.x), 0)),
+    biocrust_cover = replace_na(biocrust_cover, 0),  
+    site        = factor(site),
+    transect    = factor(ifelse(transect == "R", "Reference", "Disturbed"),
+                         levels = c("Reference", "Disturbed")),
+    transect_ID = interaction(site, transect, drop = TRUE),
+    colonized   = round(am_RLC),          #intersections colonized (of 100)
+    uncolonized = 100 - colonized
+  )
+
+#host-specific datasets
+bogr <- filter(mip_all, bioassay_host == "Bouteloua gracilis")
+corn <- filter(mip_all, bioassay_host == "Zea mays")
+
+#combo dataset for the two-host model. Each B. gracilis and Z. mays pot was
+#filled from the same field sample, so pairs are matched by site, transect, and
+#position along the transect (m_mark).
+both_hosts <- mip_all %>%
+  mutate(
+    bioassay_host = factor(bioassay_host,
+                           levels = c("Bouteloua gracilis", "Zea mays")),
+    soil_ID = interaction(site, transect, m_mark, drop = TRUE)
+  )
+```
+
+# 3. Transect effects: two-way ANOVAs and within-site contrasts (Fig 1, Table S2)
+
+Each site contributes one pre-specified Reference vs Disturbed contrast, following
+a significant site x transect interaction, so contrasts are not adjusted for
+multiple comparisons. Each contrast is reported with its 95% CI and Cohen's d
+(contrast / ANOVA residual SD). As a robustness check, contrasts are also
+recalculated with heteroscedasticity-consistent (HC3) standard errors.
+
+```{r anova-function}
+sig_symbol <- function(p) {
+  case_when(
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    p < 0.10  ~ "\u2020",   #dagger = marginally significant
+    TRUE      ~ "ns"
+  )
+}
+
+run_host_anova <- function(dat) {
+  fit <- aov(am_RLC ~ transect * site, data = dat)
+
+  #assumption checks
+  shapiro <- shapiro.test(residuals(fit))
+  levene  <- leveneTest(am_RLC ~ interaction(site, transect), data = dat)
+
+  eta <- eta_squared(fit, partial = TRUE, ci = 0.95)
+
+  emm <- emmeans(fit, ~ transect | site)
+
+  #reference - disturbed within each site, with 95% CIs (no adjustment)
+  contrasts <- pairs(emm, adjust = "none") %>%
+    summary(infer = c(TRUE, TRUE)) %>%
+    as.data.frame()
+
+  #Cohen's d = contrast / residual SD
+  d_vals <- eff_size(emm, sigma = sigma(fit), edf = df.residual(fit)) %>%
+    summary() %>%
+    as.data.frame() %>%
+    select(site, cohens_d = effect.size, d_lower = lower.CL, d_upper = upper.CL)
+
+  #robustness check: HC3 (heteroscedasticity-consistent) standard errors
+  #(refit as lm: emmeans can't take a custom vcov for an aov object)
+  fit_lm <- lm(am_RLC ~ transect * site, data = dat)
+  robust <- emmeans(fit_lm, ~ transect | site,
+                    vcov. = car::hccm(fit_lm, type = "hc3")) %>%
+    pairs(adjust = "none") %>%
+    as.data.frame() %>%
+    select(site, SE_HC3 = SE, p_HC3 = p.value)
+
+  contrasts <- contrasts %>%
+    left_join(d_vals, by = "site") %>%
+    left_join(robust, by = "site")
+
+  list(fit = fit, anova = summary(fit), shapiro = shapiro, levene = levene,
+       eta = eta, contrasts = contrasts)
+}
+
+bogr_aov <- run_host_anova(bogr)
+corn_aov <- run_host_anova(corn)
+```
+
+```{r anova-results, fig.height = 5, fig.width = 10}
+#residual diagnostic plots (residuals vs fitted, Q-Q, scale-location, leverage)
+par(mfrow = c(2, 4))
+plot(bogr_aov$fit, main = "B. gracilis")
+plot(corn_aov$fit, main = "Z. mays")
+par(mfrow = c(1, 1))
+
+#B. gracilis
+bogr_aov$anova
+bogr_aov$eta
+bogr_aov$shapiro
+bogr_aov$levene
+bogr_aov$contrasts
+
+#Z. mays
+corn_aov$anova
+corn_aov$eta
+corn_aov$shapiro
+corn_aov$levene
+corn_aov$contrasts
+
+#Table S2 (contrast portion)
+table_s2 <- bind_rows(
+  bogr_aov$contrasts %>% mutate(host = "B. gracilis"),
+  corn_aov$contrasts %>% mutate(host = "Z. mays")
+) %>%
+  transmute(host, site = site_labels[as.character(site)], estimate, lower.CL, upper.CL,
+            SE, t.ratio, p.value, cohens_d, p_HC3)
+table_s2
+write.csv(table_s2, file.path(fig_dir, "TableS2_contrasts.csv"), row.names = FALSE)
+```
+
+## Fig 1
+
+```{r figure-1, fig.height = 7.5}
+host_boxplot <- function(dat, contrasts, host_label) {
+  labels <- contrasts %>%
+    mutate(sig = sig_symbol(p.value),
+           y   = max(dat$am_RLC) * 1.1)   #same height for every site in this host's row
+
+  ggplot(dat, aes(transect, am_RLC, fill = transect)) +
+    geom_boxplot(outlier.size = 1, linewidth = 0.4) +
+    geom_text(data = labels, aes(x = 1.5, y = y, label = sig),
+              inherit.aes = FALSE, size = 4) +
+    facet_grid(~ site, labeller = labeller(site = site_labels)) +
+    scale_fill_manual(values = transect_cols, name = "Transect") +
+    scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0.02, 0.1))) +
+    labs(x = NULL, y = "AM colonization (%)", title = host_label) +
+    theme_pub +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+          plot.title = element_text(size = 11))
+}
+
+fig1a <- host_boxplot(bogr, bogr_aov$contrasts, expression(italic("B. gracilis")))
+fig1b <- host_boxplot(corn, corn_aov$contrasts, expression(italic("Z. mays")))
+
+#paired-sample regression between hosts
+paired <- inner_join(
+  bogr %>% select(site, transect, m_mark, bogr = am_RLC),
+  corn %>% select(site, transect, m_mark, corn = am_RLC),
+  by = c("site", "transect", "m_mark")
+)
+
+host_lm <- lm(corn ~ bogr, data = paired)
+summary(host_lm)
+
+fig1c <- ggplot(paired, aes(bogr, corn)) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "black",
+              fill = "grey60", alpha = 0.35, linewidth = 0.7) +
+  geom_point(aes(color = transect), size = 1.6, alpha = 0.8) +
+  stat_poly_eq(
+    aes(label = paste(after_stat(eq.label), after_stat(rr.label),
+                      after_stat(p.value.label), sep = "*\"; \"*")),
+    formula = y ~ x, parse = TRUE, size = 3.2, small.p = TRUE,
+    label.x.npc = "left", label.y.npc = 0.97
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.15))) +
+  scale_color_manual(values = transect_cols, guide = "none") +  
+  labs(x = expression(italic("B. gracilis") * " colonization (%)"),
+       y = expression(italic("Z. mays") * " colonization (%)")) +
+  theme_pub
+
+fig1 <- fig1a + fig1b + fig1c + guide_area() +
+  plot_layout(design = "AAAA\nBBBB\nCCDD",
+              heights = c(1, 1, 1.4),
+              guides = "collect") +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")")
+
+fig1
+save_fig(fig1, "Figure1", height = 200)
+```
+
+# 4. Plant community composition: NMDS and PERMANOVA (Fig 2)
+
+```{r nmds-setup}
+comm_cols <- c(
+  "nat_shrub_cover", "nonnat_shrub_cover", "nat_grass_cover",
+  "nonnat_grass_cover", "nat_forb_cover", "nonnat_forb_cover",
+  "biocrust_cover", "bare_cover"
+)
+
+covar_labels <- c(
+  nat_shrub_cover = "Native shrub", nonnat_shrub_cover = "Non-native shrub",
+  nat_grass_cover = "Native grass", nonnat_grass_cover = "Non-native grass",
+  nat_forb_cover  = "Native forb",  nonnat_forb_cover  = "Non-native forb",
+  biocrust_cover  = "Biocrust",     bare_cover         = "Bare ground"
+)
+
+comm <- as.matrix(bogr[, comm_cols])
+veg_dist <- vegdist(comm, method = "bray")
+```
+
+```{r permanova}
+#global PERMANOVA and homogeneity of dispersion
+permanova_all <- adonis2(veg_dist ~ transect * site, data = bogr,
+                         permutations = 999, by = "terms")
+permanova_all
+anova(betadisper(veg_dist, bogr$transect))
+anova(betadisper(veg_dist, bogr$site))
+```
+
+```{r figure-2, fig.height = 8}
+#(a) global NMDS with cover vectors
+nmds_all <- metaMDS(comm, distance = "bray", k = 2, trymax = 200,
+                    autotransform = TRUE, trace = FALSE)
+
+scores_all <- as.data.frame(scores(nmds_all, display = "sites")) %>%
+  bind_cols(bogr %>% select(site, transect))
+
+vec_fit <- envfit(nmds_all, bogr[, comm_cols], permutations = 999)
+vec_fit
+
+vec_df <- as.data.frame(scores(vec_fit, display = "vectors")) %>%
+  rownames_to_column("variable") %>%
+  mutate(label = covar_labels[variable],
+         across(c(NMDS1, NMDS2), ~ .x * ordiArrowMul(vec_fit)))
+
+fig2a <- ggplot(scores_all, aes(NMDS1, NMDS2, color = transect)) +
+  stat_ellipse(aes(fill = transect), type = "norm", level = 0.95,
+               geom = "polygon", alpha = 0.2, color = NA) +   #95% normal data ellipses
+  geom_point(size = 1.8, alpha = 0.75) +
+  geom_segment(data = vec_df, aes(x = 0, y = 0, xend = NMDS1, yend = NMDS2),
+               inherit.aes = FALSE, linewidth = 0.4,
+               arrow = arrow(length = unit(0.15, "cm"))) +
+  geom_text_repel(data = vec_df, aes(NMDS1, NMDS2, label = label),
+                  inherit.aes = FALSE, size = 3, min.segment.length = Inf) +
+  scale_color_manual(values = transect_cols, name = "Transect") +
+  scale_fill_manual(values = transect_cols, guide = "none") +
+  coord_equal() +
+  labs(subtitle = paste0("Bray-Curtis; stress = ", round(nmds_all$stress, 3))) +
+  theme_pub
+
+#(b) independent NMDS and PERMANOVA within each site
+site_nmds <- bogr %>%
+  split(.$site) %>%
+  imap(function(d, site_name) {
+    m <- as.matrix(d[, comm_cols])
+    set.seed(123)
+    nm <- metaMDS(m, distance = "bray", k = 2, trymax = 200,
+                  autotransform = TRUE, trace = FALSE)
+    ad <- adonis2(vegdist(m, method = "bray") ~ transect, data = d,
+                  permutations = 999)
+    list(
+      scores = as.data.frame(scores(nm, display = "sites")) %>%
+        mutate(site = site_name, transect = d$transect),
+      stats = tibble(site = site_name, stress = nm$stress,
+                     R2 = ad$R2[1], p_perm = ad$`Pr(>F)`[1])
+    )
+  })
+
+site_scores <- map_dfr(site_nmds, "scores")
+site_stats  <- map_dfr(site_nmds, "stats") %>%
+  mutate(label = paste0("stress = ", round(stress, 3),
+                        "\nPERMANOVA p = ", signif(p_perm, 2)))
+site_stats
+
+fig2b <- ggplot(site_scores, aes(NMDS1, NMDS2, color = transect)) +
+  stat_ellipse(aes(fill = transect), type = "norm", level = 0.95,
+               geom = "polygon", alpha = 0.2, color = NA) +   #95% normal data ellipses
+  geom_point(size = 1.5, alpha = 0.75) +
+  geom_text(data = site_stats, aes(x = -Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = -0.05, vjust = 1.15, size = 2.6) +
+  facet_wrap(~ site, nrow = 2, labeller = labeller(site = site_labels)) +
+  scale_color_manual(values = transect_cols, guide = "none") +  #legend comes from (a)
+  scale_fill_manual(values = transect_cols, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = 0.25)) +
+  scale_y_continuous(expand = expansion(mult = 0.25)) +
+  theme_pub +
+  theme(axis.text = element_text(size = 8))
+
+fig2 <- fig2a / fig2b +
+  plot_layout(heights = c(1.1, 1), guides = "collect") +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(legend.position = "bottom")
+
+fig2
+save_fig(fig2, "Figure2", height = 230)
+```
+
+# 5. Cover regressions and correlations (Fig 3, Fig S5)
+
+```{r figure-3, fig.height = 7}
+fmt_p <- function(p) ifelse(p < 0.001, "p < 0.001", sprintf("p = %.3f", p))
+
+cover_plot <- function(xvar, xlab) {
+  stats <- bogr %>%
+    group_by(site) %>%
+    group_modify(~ {
+      m <- lm(reformulate(xvar, "am_RLC"), data = .x)
+      tibble(intercept = coef(m)[1], slope = coef(m)[2],
+             r2 = summary(m)$r.squared,
+             p  = coef(summary(m))[2, "Pr(>|t|)"])
+    }) %>%
+    ungroup() %>%
+    mutate(
+      sig = ifelse(p < 0.05, "sig", "ns"),
+      label = sprintf("y = %.1f %s %.2fx\nR\u00b2 = %.2f, %s",
+                      intercept, ifelse(slope < 0, "\u2212", "+"), abs(slope),
+                      r2, fmt_p(p))
+    )
+  print(stats)
+
+  bogr %>%
+    left_join(select(stats, site, sig), by = "site") %>%
+    ggplot(aes(.data[[xvar]], am_RLC)) +
+    geom_smooth(aes(linetype = sig), method = "lm", formula = y ~ x,
+                color = "black", fill = "grey60", alpha = 0.35,
+                linewidth = 0.6, show.legend = FALSE) +
+    geom_point(aes(color = transect), size = 1.4, alpha = 0.8) +
+    geom_text(data = stats, aes(x = -Inf, y = Inf, label = label),
+              inherit.aes = FALSE, hjust = -0.04, vjust = 1.2, size = 2.2,
+              lineheight = 0.95) +
+    facet_grid(~ site, labeller = labeller(site = site_labels)) +
+    scale_color_manual(values = transect_cols, name = "Transect") +
+    scale_linetype_manual(values = c(sig = "solid", ns = "22")) +
+    scale_x_continuous(limits = c(0, 100), breaks = c(0, 50, 100)) +
+    scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0.02, 0.35))) +
+    labs(x = xlab, y = expression(italic("B. gracilis") * " colonization (%)")) +
+    theme_pub +
+    theme(axis.text.x = element_text(size = 8),
+          panel.spacing.x = unit(4, "mm"))
+}
+
+fig3a <- cover_plot("nat_grass_cover", "Native grass cover (%)")
+fig3b <- cover_plot("bare_cover", "Bare ground cover (%)")
+
+fig3 <- fig3a / fig3b +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(legend.position = "bottom")
+
+fig3
+save_fig(fig3, "Figure3", height = 185)
+```
+
+```{r figure-S5, fig.height = 7}
+corr_vars <- bogr %>%
+  select(
+    "AM colonization" = am_RLC,
+    "Native forb" = nat_forb_cover, "Native shrub" = nat_shrub_cover,
+    "Native grass" = nat_grass_cover, "Total native" = total_nat_cover,
+    "Non-native forb" = nonnat_forb_cover, "Non-native shrub" = nonnat_shrub_cover,
+    "Non-native grass" = nonnat_grass_cover, "Total non-native" = total_nonnat_cover,
+    "Total vegetation" = total_veg_cover, "Biocrust" = biocrust_cover,
+    "Bare ground" = bare_cover
+  )
+
+corr_matrix <- cor(corr_vars, use = "complete.obs")
+round(corr_matrix["AM colonization", ], 2)
+
+draw_corrplot <- function() {
+  corrplot(corr_matrix, method = "color", type = "upper", diag = FALSE,
+           col = colorRampPalette(c("#D55E00", "white", "#009E73"))(200),
+           tl.col = "black", tl.cex = 0.9, addCoef.col = "black", number.cex = 0.7)
+}
+
+draw_corrplot()
+save_base_fig("FigureS5", draw_corrplot(), height = 150)
+```
+
+# 6. Beta-binomial GLMM (main model; Fig S6)
+
+```{r glmm}
+bogr <- bogr %>%
+  mutate(grass_c = as.numeric(scale(nat_grass_cover, scale = FALSE)),
+         bare_c  = as.numeric(scale(bare_cover,      scale = FALSE)))
+
+m_bb <- glmmTMB(
+  cbind(colonized, uncolonized) ~ grass_c + bare_c + (1 | site/transect),
+  family = betabinomial(link = "logit"),
+  data = bogr
+)
+
+summary(m_bb)
+car::Anova(m_bb, type = 2)                        #wald chi-square tests
+#odds ratios per 10% increase in cover
+or_per10 <- function(model) {
+  model_parameters(model, effects = "fixed", ci = 0.95) %>%
+    as_tibble() %>%
+    filter(Parameter %in% c("grass_c", "bare_c")) %>%
+    mutate(across(c(Coefficient, CI_low, CI_high), ~ exp(10 * .x))) %>%
+    select(Parameter, OR_per10 = Coefficient, CI_low, CI_high, p)
+}
+or_per10(m_bb)
+r2_nakagawa(m_bb)                                 #marginal / conditional R2
+sigma(m_bb)                                       #beta-binomial dispersion
+```
+
+```{r glmm-collinearity}
+cor(bogr$nat_grass_cover, bogr$bare_cover)
+check_collinearity(m_bb)                          #VIF
+```
+
+```{r glmm-predictions}
+#predicted colonization across observed range of each predictor
+grass_pred <- ggpredict(m_bb, terms = "grass_c")
+bare_pred  <- ggpredict(m_bb, terms = "bare_c")
+round(range(grass_pred$predicted) * 100, 1)
+round(range(bare_pred$predicted)  * 100, 1)
+```
+
+```{r glmm-diagnostics, fig.height = 5}
+res_bb <- simulateResiduals(m_bb, n = 1000)
+
+testUniformity(res_bb, plot = FALSE)
+testDispersion(res_bb, plot = FALSE)
+testOutliers(res_bb, plot = FALSE)
+check_overdispersion(m_bb)
+
+plot(res_bb)
+save_base_fig("FigureS6", plot(res_bb))
+```
+
+# 7. AR(1) sensitivity model for within-transect autocorrelation (Fig S3)
+
+```{r ar1}
+bogr <- bogr %>%
+  mutate(position_f = factor(m_mark, levels = sort(unique(m_mark))))
+
+m_bb_ar1 <- glmmTMB(
+  cbind(colonized, uncolonized) ~ grass_c + bare_c +
+    (1 | site/transect) + ar1(position_f + 0 | transect_ID),
+  family = betabinomial(link = "logit"),
+  data = bogr
+)
+
+summary(m_bb_ar1)
+```
+
+```{r figure-S3, fig.height = 3.5}
+aic_tab <- AIC(m_bb, m_bb_ar1)
+
+coef_compare <- bind_rows(
+  or_per10(m_bb)     %>% mutate(model = "Original model"),
+  or_per10(m_bb_ar1) %>% mutate(model = "AR(1) model")
+) %>%
+  mutate(
+    Parameter = dplyr::recode(Parameter,             
+                              grass_c = "Native grass cover",
+                              bare_c  = "Bare ground cover"),
+    model = factor(model, levels = c("Original model", "AR(1) model"))
+  )
+
+figS3 <- ggplot(coef_compare, aes(OR_per10, Parameter, color = model)) +
+  geom_vline(xintercept = 1, linetype = "22", color = "grey50") +
+  geom_pointrange(aes(xmin = CI_low, xmax = CI_high),
+                  position = position_dodge(width = 0.5), size = 0.4) +
+  scale_color_manual(values = c("Original model" = "black",
+                                "AR(1) model" = "#0072B2"), name = NULL) +
+  labs(x = "Odds ratio per 10% increase in cover (95% CI)", y = NULL,
+       subtitle = sprintf("AIC: original = %.1f; AR(1) = %.1f",
+                          aic_tab["m_bb", "AIC"], aic_tab["m_bb_ar1", "AIC"])) +
+  theme_pub
+
+figS3
+save_fig(figS3, "FigureS3", height = 75)
+```
+
+# 8. Combined-host GLMM (Fig S4)
+
+```{r combined-model}
+both_hosts <- both_hosts %>%
+  mutate(grass_c = as.numeric(scale(nat_grass_cover, scale = FALSE)),
+         bare_c  = as.numeric(scale(bare_cover,      scale = FALSE)))
+
+m_hosts <- glmmTMB(
+  cbind(colonized, uncolonized) ~ bioassay_host + grass_c + bare_c +
+    (1 | site/transect) + (1 | soil_ID),
+  family = betabinomial(link = "logit"),
+  data = both_hosts
+)
+
+m_hosts_int <- glmmTMB(
+  cbind(colonized, uncolonized) ~ bioassay_host * (grass_c + bare_c) +
+    (1 | site/transect) + (1 | soil_ID),
+  family = betabinomial(link = "logit"),
+  data = both_hosts
+)
+
+summary(m_hosts)
+model_parameters(m_hosts, exponentiate = TRUE, ci = 0.95)   #host odds ratio 
+or_per10(m_hosts)                                           #cover odds ratios per 10% 
+anova(m_hosts, m_hosts_int)    #do cover effects differ by host?
+```
+
+```{r figure-S4, fig.height = 5}
+res_hosts <- simulateResiduals(m_hosts, n = 1000)
+
+testUniformity(res_hosts, plot = FALSE)
+testDispersion(res_hosts, plot = FALSE)
+testOutliers(res_hosts, plot = FALSE)
+
+plot(res_hosts)
+save_base_fig("FigureS4", plot(res_hosts))
+```
+
+# 9. Session info
+
+```{r session-info}
+sessionInfo()
+```
